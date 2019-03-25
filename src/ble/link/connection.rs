@@ -12,11 +12,11 @@ use {
         time::{Duration, Instant, Timer},
         utils::HexSlice,
     },
-    core::marker::PhantomData,
+    core::{marker::PhantomData, mem},
 };
 
 /// Connection state.
-pub struct Connection<L: Logger, T: Timer> {
+pub struct Connection<L: Logger, T: Timer, R: Transmitter> {
     access_address: u32,
     crc_init: u32,
     channel_map: ChannelMap,
@@ -44,12 +44,20 @@ pub struct Connection<L: Logger, T: Timer> {
     last_header: data::Header,
 
     /// Whether we have ever received a data packet in this connection.
+    ///
+    /// If this is `true`, the connection is considered established, which changes the handling of
+    /// the supervision timeout.
     received_packet: bool,
 
-    _p: PhantomData<(L, T)>,
+    next_packet: Pdu<'static>,
+    wants_to_send: bool,
+
+    master_md: bool,
+
+    _p: PhantomData<(L, T, R)>,
 }
 
-impl<L: Logger, T: Timer> Connection<L, T> {
+impl<L: Logger, T: Timer, R: Transmitter> Connection<L, T, R> {
     /// Initializes a connection state according to the `LLData` contained in the `CONNECT_REQ`
     /// advertising PDU.
     ///
@@ -80,6 +88,9 @@ impl<L: Logger, T: Timer> Connection<L, T> {
             next_expected_seq_num: SeqNum::ZERO,
             last_header: Header::new(Llid::DataCont),
             received_packet: false,
+            next_packet: Pdu::empty(),
+            wants_to_send: false,
+            master_md: false,
 
             _p: PhantomData,
         };
@@ -104,10 +115,9 @@ impl<L: Logger, T: Timer> Connection<L, T> {
     /// Called by the `LinkLayer` when a data channel packet is received.
     ///
     /// Returns `Err(())` when the connection is ended (not necessarily due to an error condition).
-    pub fn process_data_packet<R: Transmitter>(
+    pub fn process_data_packet(
         &mut self,
         rx_end: Instant,
-        tx: &mut R,
         hw: &mut HwInterface<L, T>,
         header: data::Header,
         payload: &[u8],
@@ -126,25 +136,12 @@ impl<L: Logger, T: Timer> Connection<L, T> {
             // If CRC is bad, this bit could be flipped, so we always retransmit in that case.
             if self.received_packet {
                 self.last_header.set_nesn(self.next_expected_seq_num);
-                let d = hw.timer.now().duration_since(rx_end);
-                tx.transmit_data(
-                    self.access_address,
-                    self.crc_init,
-                    self.last_header,
-                    self.channel,
-                );
-                let before_log = hw.timer.now();
-                trace!(hw.logger, "<<RESEND {} after RX>>", d);
-                trace!(
-                    hw.logger,
-                    "<<That LOG took {}>>",
-                    hw.timer.now().duration_since(before_log)
-                );
+            //hw.logger.write_str("<<RESEND>>\n").unwrap();
             } else {
                 // We've never received (and thus sent) a data packet before, so we can't
                 // *re*transmit anything. Send empty PDU instead.
                 self.received_packet = true;
-                self.send(Pdu::empty(), tx, &mut hw.logger);
+                self.next_packet = Pdu::empty();
             }
         } else {
             self.received_packet = true;
@@ -154,20 +151,16 @@ impl<L: Logger, T: Timer> Connection<L, T> {
 
             self.transmit_seq_num += SeqNum::ONE;
 
-            // Send a new packet
-            self.send(Pdu::empty(), tx, &mut hw.logger);
+            // Prepare sending a new packet
+            self.next_packet = Pdu::empty();
         }
 
         let last_channel = self.channel;
 
-        // If both devices set MD to `false`, the connection event closes and we hop to the next
-        // channel.
-        // If the CRC is bad, we must hop anyways.
-        if !crc_ok || (!header.md() && !self.has_more_data()) {
-            self.hop_channel();
-        }
+        // If the CRC is bad, we hop channels, pretending that MD=false
+        self.master_md = crc_ok && header.md();
 
-        trace!(
+        /*trace!(
             hw.logger,
             "DATA({}->{})<- {}{:?}, {:?}",
             last_channel.index(),
@@ -175,11 +168,17 @@ impl<L: Logger, T: Timer> Connection<L, T> {
             if crc_ok { "" } else { "BADCRC, " },
             header,
             HexSlice(payload)
-        );
+        );*/
 
+        // After receiving a packet from the master, we *always* send one back. Set a timer that
+        // expires after the IFS is over.
+        self.wants_to_send = true;
+        let send_at = rx_end + Duration::T_IFS;
+        let d = send_at.duration_since(hw.timer.now());
+        trace!(hw.logger, "DATA<-; {}; sending in {}", self.master_md, d);
         Ok(Cmd {
-            next_update: NextUpdate::At(hw.timer.now() + self.conn_event_timeout()),
-            radio: RadioCmd::ListenData {
+            next_update: NextUpdate::At(send_at),
+            radio: RadioCmd::PrepareTx {
                 channel: self.channel,
                 access_address: self.access_address,
                 crc_init: self.crc_init,
@@ -187,7 +186,19 @@ impl<L: Logger, T: Timer> Connection<L, T> {
         })
     }
 
-    pub fn timer_update(&mut self, hw: &mut HwInterface<L, T>) -> Result<Cmd, ()> {
+    pub fn timer_update(&mut self, tx: &mut R, hw: &mut HwInterface<L, T>) -> Result<Cmd, ()> {
+        if self.wants_to_send {
+            self.wants_to_send = false;
+            // Send a response PDU to the master
+            let pdu = mem::replace(&mut self.next_packet, Pdu::empty());
+            self.send(pdu, tx, &mut hw.logger);
+
+            // Possibly hop channels here
+            if !self.master_md && !self.has_more_data() {
+                self.hop_channel();
+            }
+        }
+
         if self.received_packet {
             // No packet from master, skip this connection event and listen on the next channel
 
@@ -249,7 +260,7 @@ impl<L: Logger, T: Timer> Connection<L, T> {
     }
 
     /// Sends a new PDU to the connected device (ie. a non-retransmitted PDU).
-    fn send<R: Transmitter>(&mut self, pdu: Pdu<'_>, tx: &mut R, logger: &mut L) {
+    fn send(&mut self, pdu: Pdu<'_>, tx: &mut R, logger: &mut L) {
         let mut payload_writer = ByteWriter::new(tx.tx_payload_buf());
         // Serialize PDU. This should never fail, because the upper layers are supposed to fragment
         // packets so they always fit.

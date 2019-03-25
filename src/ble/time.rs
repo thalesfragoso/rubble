@@ -16,6 +16,9 @@ use core::{
 pub struct Duration(u32);
 
 impl Duration {
+    /// The interframe spacing used by BLE packets (`T_IFS`).
+    pub const T_IFS: Self = Duration(150);
+
     /// Creates a `Duration` from a number of microseconds.
     pub fn from_micros(micros: u32) -> Self {
         Duration(micros)

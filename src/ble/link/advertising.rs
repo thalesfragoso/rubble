@@ -703,6 +703,9 @@ impl Header {
         Header(u8::from(ty) as u16)
     }
 
+    /// Parses a header from raw bytes.
+    ///
+    /// This will panic if `raw` contains less than 2 Bytes.
     pub fn parse(raw: &[u8]) -> Self {
         Header(LittleEndian::read_u16(&raw))
     }
