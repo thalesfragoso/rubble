@@ -174,8 +174,7 @@ impl<L: Logger, T: Timer, R: Transmitter> Connection<L, T, R> {
         // expires after the IFS is over.
         self.wants_to_send = true;
         let send_at = rx_end + Duration::T_IFS;
-        let d = send_at.duration_since(hw.timer.now());
-        trace!(hw.logger, "DATA<-; {}; sending in {}", self.master_md, d);
+        trace!(hw.logger, "DATA<-; {}", self.master_md);
         Ok(Cmd {
             next_update: NextUpdate::At(send_at),
             radio: RadioCmd::PrepareTx {
